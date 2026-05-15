@@ -1,103 +1,162 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
-import { firestore, auth } from '@/config/firebase';
+import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { ref, onValue, off } from 'firebase/database';
+import { database, auth } from '@/config/firebase';
 
-interface Order {
-  id: string;
-  workflowType: 'direct_trip' | 'store_delivery';
+// RTDB-based trip request structure
+interface TripRequestData {
+  pickupAddress: string;
+  destinationAddress: string;
+  pickupLat: number;
+  pickupLng: number;
+  dropLat: number;
+  dropLng: number;
+  total: number;
+  fee: number;
+  userName: string;
+  userPhone: string;
+  workflowType?: string;
+  serviceType?: string;
+  dispatchService?: string;
+}
+
+interface TripRequest {
+  orderId: string;
+  workflowType: 'direct_trip' | 'delivery';
+  requestType: string;
   status: string;
-  driverStatus?: string;
-  pickup?: string;
-  pickupAddress?: string;
-  destination?: string;
-  destinationAddress?: string;
-  fare?: number;
-  price?: number;
-  userName?: string;
-  clientName?: string;
-  userId?: string;
-  clientId?: string;
-  [key: string]: any;
+  createdAt: number;
+  expiresAt: number;
+  data: TripRequestData;
 }
 
-interface OrdersContextType {
-  activeOrder: Order | null;
-  hasActiveOrder: boolean;
+interface TripRequestContextType {
+  currentRequest: TripRequest | null;
+  isVisible: boolean;
+  isMinimized: boolean;
+  setIsMinimized: (value: boolean) => void;
+  isLoading: boolean;
+  setIsLoading: (value: boolean) => void;
+  clearRequest: () => void;
 }
 
-const OrdersContext = createContext<OrdersContextType | undefined>(undefined);
+const TripRequestContext = createContext<TripRequestContextType | undefined>(undefined);
 
-export function OrdersProvider({ children }: { children: React.ReactNode }) {
-  const [activeOrder, setActiveOrder] = useState<Order | null>(null);
+export function TripRequestProvider({ children }: { children: ReactNode }) {
+  const [currentRequest, setCurrentRequest] = useState<TripRequest | null>(null);
+  const [isVisible, setIsVisible] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
-    const uid = auth.currentUser?.uid;
+    const checkAuth = () => {
+      const uid = auth.currentUser?.uid;
+      if (!uid) {
+        // Clear state when not authenticated
+        setCurrentRequest(null);
+        setIsVisible(false);
+        return null;
+      }
+      return uid;
+    };
+
+    const uid = checkAuth();
     if (!uid) return;
 
-    // Listen to Firestore orders collection where driverId matches current driver
-    // AND status is not "completed"
-    const ordersRef = collection(firestore, 'orders');
-    const q = query(
-      ordersRef,
-      where('driverId', '==', uid),
-      where('status', '!=', 'completed')
-    );
+    // Listen ONLY to driver_trip_requests/{driverUid} in RTDB
+    const tripRequestsRef = ref(database, `driver_trip_requests/${uid}`);
+    
+    const listener = onValue(tripRequestsRef, (snapshot) => {
+      const data = snapshot.val();
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      if (snapshot.empty) {
-        setActiveOrder(null);
+      if (!data) {
+        // No requests - hide panel only if status was terminal
+        if (!currentRequest || 
+            currentRequest.status === 'completed' || 
+            currentRequest.status === 'rejected' || 
+            currentRequest.status === 'expired' ||
+            currentRequest.status === 'cancelled') {
+          setCurrentRequest(null);
+          setIsVisible(false);
+        }
         return;
       }
 
-      // Get the first active order (there should typically be only one)
-      const orderDoc = snapshot.docs[0];
-      const orderData = orderDoc.data();
-      
-      setActiveOrder({
-        id: orderDoc.id,
-        workflowType: orderData.workflowType || 'direct_trip',
-        status: orderData.status,
-        driverStatus: orderData.driverStatus,
-        pickup: orderData.pickup || orderData.pickupAddress,
-        pickupAddress: orderData.pickupAddress || orderData.pickup,
-        destination: orderData.destination || orderData.destinationAddress,
-        destinationAddress: orderData.destinationAddress || orderData.destination,
-        fare: orderData.fare || orderData.price,
-        price: orderData.price || orderData.fare,
-        userName: orderData.userName || orderData.clientName,
-        clientName: orderData.clientName || orderData.userName,
-        userId: orderData.userId || orderData.clientId,
-        clientId: orderData.clientId || orderData.userId,
-        ...orderData,
-      });
-    }, (error) => {
-      console.error('[v0] Error listening to orders:', error);
-      setActiveOrder(null);
+      // Get all requests
+      const requests = Object.entries(data).map(([orderId, requestData]: [string, any]) => ({
+        orderId,
+        ...requestData,
+      })) as TripRequest[];
+
+      if (requests.length === 0) {
+        if (!currentRequest || ['completed', 'rejected', 'expired', 'cancelled'].includes(currentRequest.status)) {
+          setCurrentRequest(null);
+          setIsVisible(false);
+        }
+        return;
+      }
+
+      // Get the active request (not in terminal state)
+      const activeRequest = requests.find(r => 
+        !['completed', 'rejected', 'expired', 'cancelled'].includes(r.status)
+      );
+
+      if (activeRequest) {
+        setCurrentRequest(activeRequest);
+
+        // Show panel on incoming request
+        if (activeRequest.status === 'incoming_request' && !isVisible) {
+          setIsVisible(true);
+          setIsMinimized(false);
+        }
+
+        // Handle terminal statuses - hide after brief delay
+        if (['completed', 'rejected', 'expired', 'cancelled'].includes(activeRequest.status)) {
+          setTimeout(() => {
+            setIsVisible(false);
+            setCurrentRequest(null);
+          }, 1000);
+        }
+      } else {
+        // No active request found
+        setCurrentRequest(null);
+        setIsVisible(false);
+      }
     });
 
-    return () => unsubscribe();
-  }, []);
+    return () => off(tripRequestsRef, 'value', listener);
+  }, [currentRequest?.status, isVisible]);
+
+  const clearRequest = () => {
+    setCurrentRequest(null);
+    setIsVisible(false);
+    setIsMinimized(false);
+  };
 
   return (
-    <OrdersContext.Provider
+    <TripRequestContext.Provider
       value={{
-        activeOrder,
-        hasActiveOrder: activeOrder !== null,
+        currentRequest,
+        isVisible,
+        isMinimized,
+        setIsMinimized,
+        isLoading,
+        setIsLoading,
+        clearRequest,
       }}
     >
       {children}
-    </OrdersContext.Provider>
+    </TripRequestContext.Provider>
   );
 }
 
-export function useOrders() {
-  const context = useContext(OrdersContext);
+export function useTripRequest() {
+  const context = useContext(TripRequestContext);
   if (context === undefined) {
-    throw new Error('useOrders must be used within OrdersProvider');
+    throw new Error('useTripRequest must be used within TripRequestProvider');
   }
   return context;
 }
 
-// Keep old export for backward compatibility during migration
-export const IncomingRidesProvider = OrdersProvider;
-export const useIncomingRides = useOrders;
+// Keep backward compatibility exports during migration
+export const IncomingRidesProvider = TripRequestProvider;
+export const useIncomingRides = useTripRequest;

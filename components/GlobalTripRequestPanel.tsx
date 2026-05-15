@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,18 +8,24 @@ import {
   Animated,
   PanResponder,
   Platform,
+  ActivityIndicator,
 } from 'react-native';
-import { User, MapPin, Navigation, DollarSign, Hash, GripHorizontal } from 'lucide-react-native';
+import { User, MapPin, Navigation, DollarSign, Hash, Phone, Package, Car, Truck } from 'lucide-react-native';
 import { ref, onValue, off } from 'firebase/database';
 import { database, auth } from '@/config/firebase';
 
 const { width, height } = Dimensions.get('window');
 
-// Panel positions
-const PANEL_EXPANDED_Y = 0; // Fully expanded (attached to top)
-const PANEL_MINIMIZED_Y = -280; // Minimized (only handle bar visible)
-const PANEL_HEIGHT = 380;
+// Panel positions - TOP ANCHORED (Uber/Bolt style)
+const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : 30;
+const PANEL_HEIGHT = 420;
+const HANDLE_HEIGHT = 30;
+// Expanded: panel fully visible from top
+const PANEL_EXPANDED_Y = 0;
+// Minimized: only handle bar and small portion visible
+const PANEL_MINIMIZED_Y = -(PANEL_HEIGHT - HANDLE_HEIGHT - STATUS_BAR_HEIGHT);
 
+// RTDB Trip Request structure
 interface TripRequest {
   orderId: string;
   workflowType: 'direct_trip' | 'delivery';
@@ -39,84 +45,114 @@ interface TripRequest {
     userName: string;
     userPhone: string;
     serviceType?: string;
+    dispatchService?: string;
   };
 }
+
+// Backend API base URL - will be relative for same-origin
+const API_BASE = '';
 
 export default function GlobalTripRequestPanel() {
   const [currentRequest, setCurrentRequest] = useState<TripRequest | null>(null);
   const [isVisible, setIsVisible] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [countdown, setCountdown] = useState<number | null>(null);
 
   // Animation value for panel position
   const panelY = useRef(new Animated.Value(PANEL_MINIMIZED_Y)).current;
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+
+  // Animate panel to position
+  const animateToPosition = useCallback((toValue: number, showOverlay: boolean) => {
+    Animated.parallel([
+      Animated.spring(panelY, {
+        toValue,
+        useNativeDriver: true,
+        tension: 80,
+        friction: 12,
+      }),
+      Animated.timing(overlayOpacity, {
+        toValue: showOverlay ? 0.5 : 0,
+        duration: 200,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [panelY, overlayOpacity]);
 
   // Pan responder for drag gestures
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_, gestureState) => 
+        Math.abs(gestureState.dy) > 5,
       onPanResponderGrant: () => {
         panelY.stopAnimation();
       },
       onPanResponderMove: (_, gestureState) => {
-        // Calculate new position based on drag
-        const newY = isMinimized
-          ? PANEL_MINIMIZED_Y + gestureState.dy
-          : PANEL_EXPANDED_Y + gestureState.dy;
-        
-        // Clamp between minimized and expanded
+        const baseY = isMinimized ? PANEL_MINIMIZED_Y : PANEL_EXPANDED_Y;
+        const newY = baseY + gestureState.dy;
+        // Clamp between minimized (negative) and expanded (0)
         const clampedY = Math.max(PANEL_MINIMIZED_Y, Math.min(PANEL_EXPANDED_Y, newY));
         panelY.setValue(clampedY);
       },
       onPanResponderRelease: (_, gestureState) => {
         const velocity = gestureState.vy;
-        const currentY = isMinimized
-          ? PANEL_MINIMIZED_Y + gestureState.dy
-          : PANEL_EXPANDED_Y + gestureState.dy;
+        const baseY = isMinimized ? PANEL_MINIMIZED_Y : PANEL_EXPANDED_Y;
+        const currentY = baseY + gestureState.dy;
+        const midPoint = (PANEL_MINIMIZED_Y + PANEL_EXPANDED_Y) / 2;
 
-        // Snap based on velocity or position
-        if (velocity < -0.5 || (velocity >= -0.5 && velocity <= 0.5 && currentY < (PANEL_MINIMIZED_Y + PANEL_EXPANDED_Y) / 2)) {
-          // Swipe up or in upper half -> minimize
-          animateToPosition(PANEL_MINIMIZED_Y);
+        // Swipe up (negative velocity) = minimize, swipe down = expand
+        if (velocity < -0.5 || (velocity >= -0.5 && velocity <= 0.5 && currentY < midPoint)) {
+          // Minimize - swipe up
+          animateToPosition(PANEL_MINIMIZED_Y, false);
           setIsMinimized(true);
         } else {
-          // Swipe down or in lower half -> expand
-          animateToPosition(PANEL_EXPANDED_Y);
+          // Expand - swipe down
+          animateToPosition(PANEL_EXPANDED_Y, true);
           setIsMinimized(false);
         }
       },
     })
   ).current;
 
-  const animateToPosition = (toValue: number) => {
-    Animated.spring(panelY, {
-      toValue,
-      useNativeDriver: true,
-      tension: 80,
-      friction: 12,
-    }).start();
-  };
+  // Countdown timer for incoming requests
+  useEffect(() => {
+    if (!currentRequest || currentRequest.status !== 'incoming_request') {
+      setCountdown(null);
+      return;
+    }
 
-  // Listen to driver_trip_requests/{driverUid}
+    const expiresAt = currentRequest.expiresAt;
+    if (!expiresAt) return;
+
+    const updateCountdown = () => {
+      const remaining = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+      setCountdown(remaining);
+    };
+
+    updateCountdown();
+    const interval = setInterval(updateCountdown, 1000);
+
+    return () => clearInterval(interval);
+  }, [currentRequest?.orderId, currentRequest?.status, currentRequest?.expiresAt]);
+
+  // Listen to driver_trip_requests/{driverUid} - PERMANENT GLOBAL LISTENER
   useEffect(() => {
     const uid = auth.currentUser?.uid;
     if (!uid) return;
 
     const tripRequestsRef = ref(database, `driver_trip_requests/${uid}`);
+    
     const listener = onValue(tripRequestsRef, (snapshot) => {
       const data = snapshot.val();
 
       if (!data) {
-        // No requests - hide panel if status allows
-        if (currentRequest?.status === 'completed' || 
-            currentRequest?.status === 'rejected' || 
-            currentRequest?.status === 'expired' ||
-            currentRequest?.status === 'cancelled') {
+        // No requests
+        if (!currentRequest || ['completed', 'rejected', 'expired', 'cancelled'].includes(currentRequest.status)) {
           setCurrentRequest(null);
           setIsVisible(false);
-        } else if (!currentRequest) {
-          setIsVisible(false);
+          animateToPosition(PANEL_MINIMIZED_Y, false);
         }
         return;
       }
@@ -131,11 +167,12 @@ export default function GlobalTripRequestPanel() {
         if (!currentRequest || ['completed', 'rejected', 'expired', 'cancelled'].includes(currentRequest.status)) {
           setCurrentRequest(null);
           setIsVisible(false);
+          animateToPosition(PANEL_MINIMIZED_Y, false);
         }
         return;
       }
 
-      // Get the latest/current active request
+      // Get the active request (not in terminal state)
       const activeRequest = requests.find(r => 
         !['completed', 'rejected', 'expired', 'cancelled'].includes(r.status)
       );
@@ -145,30 +182,32 @@ export default function GlobalTripRequestPanel() {
         setCurrentRequest(activeRequest);
 
         // Show panel on new incoming request
-        if (activeRequest.status === 'incoming_request' && !isVisible) {
+        if (activeRequest.status === 'incoming_request' && (!isVisible || prevStatus !== 'incoming_request')) {
           setIsVisible(true);
           setIsMinimized(false);
-          animateToPosition(PANEL_EXPANDED_Y);
+          animateToPosition(PANEL_EXPANDED_Y, true);
         }
 
-        // Handle status changes that should hide panel
+        // Status changes that should hide panel
         if (['completed', 'rejected', 'expired', 'cancelled'].includes(activeRequest.status)) {
           setTimeout(() => {
             setIsVisible(false);
             setCurrentRequest(null);
-          }, 1000); // Brief delay to show final status
+            animateToPosition(PANEL_MINIMIZED_Y, false);
+          }, 1500);
         }
       } else {
-        // No active request found
+        // No active request
         setCurrentRequest(null);
         setIsVisible(false);
+        animateToPosition(PANEL_MINIMIZED_Y, false);
       }
     });
 
     return () => off(tripRequestsRef, 'value', listener);
-  }, [currentRequest?.status, isVisible]);
+  }, [currentRequest?.status, isVisible, animateToPosition]);
 
-  // API call handlers
+  // API call handlers - DO NOT manually close popup, WAIT for RTDB status update
   const callBackendAction = async (action: string) => {
     const uid = auth.currentUser?.uid;
     if (!uid || !currentRequest) return;
@@ -176,17 +215,17 @@ export default function GlobalTripRequestPanel() {
     setIsLoading(true);
     try {
       let endpoint = '';
-      let body: any = {
+      let body: Record<string, unknown> = {
         orderId: currentRequest.orderId,
         driverId: uid,
       };
 
       switch (action) {
         case 'accept':
-          endpoint = '/api/acceptDriverRequest';
+          endpoint = `${API_BASE}/api/acceptDriverRequest`;
           break;
         case 'reject':
-          endpoint = '/api/declineDriverRequest';
+          endpoint = `${API_BASE}/api/declineDriverRequest`;
           break;
         case 'arrived':
         case 'started':
@@ -194,10 +233,11 @@ export default function GlobalTripRequestPanel() {
         case 'picked_up':
         case 'delivered':
         case 'completed':
-          endpoint = '/api/updateTripStatus';
+          endpoint = `${API_BASE}/api/updateTripStatus`;
           body.status = action;
           break;
         default:
+          console.error('[v0] Unknown action:', action);
           return;
       }
 
@@ -208,11 +248,13 @@ export default function GlobalTripRequestPanel() {
       });
 
       if (!response.ok) {
-        throw new Error(`Failed to ${action}`);
+        const errorText = await response.text();
+        throw new Error(`Failed to ${action}: ${errorText}`);
       }
 
       // DO NOT manually close or update state
       // WAIT for RTDB listener to receive status update
+      console.log(`[v0] ${action} request sent successfully`);
     } catch (error) {
       console.error(`[v0] Error calling ${action}:`, error);
     } finally {
@@ -220,6 +262,7 @@ export default function GlobalTripRequestPanel() {
     }
   };
 
+  // Button handlers
   const handleAccept = () => callBackendAction('accept');
   const handleReject = () => callBackendAction('reject');
   const handleArrived = () => callBackendAction('arrived');
@@ -229,125 +272,173 @@ export default function GlobalTripRequestPanel() {
   const handlePickedUp = () => callBackendAction('picked_up');
   const handleDelivered = () => callBackendAction('delivered');
 
-  // Render buttons based on workflowType and status
+  // Render buttons based on workflowType and RTDB status
   const renderButtons = () => {
     if (!currentRequest) return null;
 
     const { workflowType, status } = currentRequest;
 
+    // DIRECT TRIP flow: incoming_request -> accepted -> arrived -> started -> completed
     if (workflowType === 'direct_trip') {
       switch (status) {
         case 'incoming_request':
           return (
             <View style={styles.buttonRow}>
               <TouchableOpacity 
-                style={styles.rejectButton} 
+                style={[styles.rejectButton, isLoading && styles.buttonDisabled]} 
                 onPress={handleReject}
                 disabled={isLoading}
               >
-                <Text style={styles.buttonText}>Reject</Text>
+                {isLoading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.buttonText}>Reject</Text>
+                )}
               </TouchableOpacity>
               <TouchableOpacity 
-                style={styles.acceptButton} 
+                style={[styles.acceptButton, isLoading && styles.buttonDisabled]} 
                 onPress={handleAccept}
                 disabled={isLoading}
               >
-                <Text style={styles.buttonText}>Accept</Text>
+                {isLoading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.buttonText}>Accept</Text>
+                )}
               </TouchableOpacity>
             </View>
           );
         case 'accepted':
           return (
             <TouchableOpacity 
-              style={styles.actionButton} 
+              style={[styles.actionButton, styles.arrivedButton, isLoading && styles.buttonDisabled]} 
               onPress={handleArrived}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Arrived</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Arrived</Text>
+              )}
             </TouchableOpacity>
           );
         case 'arrived':
           return (
             <TouchableOpacity 
-              style={styles.actionButton} 
+              style={[styles.actionButton, styles.startButton, isLoading && styles.buttonDisabled]} 
               onPress={handleStartTrip}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Start Trip</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Start Trip</Text>
+              )}
             </TouchableOpacity>
           );
         case 'started':
           return (
             <TouchableOpacity 
-              style={styles.completeButton} 
+              style={[styles.actionButton, styles.completeButton, isLoading && styles.buttonDisabled]} 
               onPress={handleComplete}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Complete</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Complete</Text>
+              )}
             </TouchableOpacity>
           );
         default:
           return null;
       }
-    } else if (workflowType === 'delivery') {
+    }
+
+    // DELIVERY flow: incoming_request -> accepted -> at_store -> picked_up -> delivered -> completed
+    if (workflowType === 'delivery') {
       switch (status) {
         case 'incoming_request':
           return (
             <View style={styles.buttonRow}>
               <TouchableOpacity 
-                style={styles.rejectButton} 
+                style={[styles.rejectButton, isLoading && styles.buttonDisabled]} 
                 onPress={handleReject}
                 disabled={isLoading}
               >
-                <Text style={styles.buttonText}>Reject</Text>
+                {isLoading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.buttonText}>Reject</Text>
+                )}
               </TouchableOpacity>
               <TouchableOpacity 
-                style={styles.acceptButton} 
+                style={[styles.acceptButton, isLoading && styles.buttonDisabled]} 
                 onPress={handleAccept}
                 disabled={isLoading}
               >
-                <Text style={styles.buttonText}>Accept</Text>
+                {isLoading ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.buttonText}>Accept</Text>
+                )}
               </TouchableOpacity>
             </View>
           );
         case 'accepted':
           return (
             <TouchableOpacity 
-              style={styles.actionButton} 
+              style={[styles.actionButton, styles.atStoreButton, isLoading && styles.buttonDisabled]} 
               onPress={handleAtStore}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>At Store</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>At Store</Text>
+              )}
             </TouchableOpacity>
           );
         case 'at_store':
           return (
             <TouchableOpacity 
-              style={styles.actionButton} 
+              style={[styles.actionButton, styles.pickedUpButton, isLoading && styles.buttonDisabled]} 
               onPress={handlePickedUp}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Picked Up</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Picked Up</Text>
+              )}
             </TouchableOpacity>
           );
         case 'picked_up':
           return (
             <TouchableOpacity 
-              style={styles.actionButton} 
+              style={[styles.actionButton, styles.deliveredButton, isLoading && styles.buttonDisabled]} 
               onPress={handleDelivered}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Delivered</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Delivered</Text>
+              )}
             </TouchableOpacity>
           );
         case 'delivered':
           return (
             <TouchableOpacity 
-              style={styles.completeButton} 
+              style={[styles.actionButton, styles.completeButton, isLoading && styles.buttonDisabled]} 
               onPress={handleComplete}
               disabled={isLoading}
             >
-              <Text style={styles.buttonText}>Complete</Text>
+              {isLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.buttonText}>Complete</Text>
+              )}
             </TouchableOpacity>
           );
         default:
@@ -358,34 +449,65 @@ export default function GlobalTripRequestPanel() {
     return null;
   };
 
-  // Get status display text
-  const getStatusText = () => {
-    if (!currentRequest) return '';
-    const statusMap: Record<string, string> = {
-      incoming_request: 'New Request',
-      accepted: 'Accepted - En route to pickup',
-      arrived: 'Arrived at pickup',
-      started: 'Trip in progress',
-      at_store: 'At store',
-      picked_up: 'Package picked up',
-      delivered: 'Delivered',
-      completed: 'Completed',
-      rejected: 'Rejected',
-      expired: 'Expired',
+  // Get status display text and color
+  const getStatusDisplay = () => {
+    if (!currentRequest) return { text: '', color: '#666', bgColor: '#E8E8E8' };
+    
+    const statusMap: Record<string, { text: string; color: string; bgColor: string }> = {
+      incoming_request: { text: 'New Request', color: '#FF6B00', bgColor: '#FFF3E0' },
+      accepted: { text: 'En Route to Pickup', color: '#2196F3', bgColor: '#E3F2FD' },
+      arrived: { text: 'At Pickup Location', color: '#4CAF50', bgColor: '#E8F5E9' },
+      started: { text: 'Trip in Progress', color: '#9C27B0', bgColor: '#F3E5F5' },
+      at_store: { text: 'At Store', color: '#FF9800', bgColor: '#FFF3E0' },
+      picked_up: { text: 'Package Picked Up', color: '#00BCD4', bgColor: '#E0F7FA' },
+      delivered: { text: 'Delivered', color: '#8BC34A', bgColor: '#F1F8E9' },
+      completed: { text: 'Completed', color: '#4CAF50', bgColor: '#E8F5E9' },
+      rejected: { text: 'Rejected', color: '#F44336', bgColor: '#FFEBEE' },
+      expired: { text: 'Expired', color: '#9E9E9E', bgColor: '#F5F5F5' },
+      cancelled: { text: 'Cancelled', color: '#F44336', bgColor: '#FFEBEE' },
     };
-    return statusMap[currentRequest.status] || currentRequest.status;
+    
+    return statusMap[currentRequest.status] || { text: currentRequest.status, color: '#666', bgColor: '#E8E8E8' };
+  };
+
+  // Get workflow icon
+  const getWorkflowIcon = () => {
+    if (!currentRequest) return <Car color="#333" size={20} />;
+    
+    if (currentRequest.workflowType === 'delivery') {
+      return <Package color="#FF6B00" size={20} />;
+    }
+    
+    const serviceType = currentRequest.data?.serviceType;
+    if (serviceType === 'truck' || serviceType === 'delivery_truck') {
+      return <Truck color="#333" size={20} />;
+    }
+    
+    return <Car color="#333" size={20} />;
   };
 
   if (!isVisible || !currentRequest) return null;
 
   const requestData = currentRequest.data || {};
-  const pickupAddress = requestData.pickupAddress || 'Unknown';
-  const destinationAddress = requestData.destinationAddress || 'Unknown';
+  const pickupAddress = requestData.pickupAddress || 'Unknown location';
+  const destinationAddress = requestData.destinationAddress || 'Unknown destination';
   const price = requestData.total || requestData.fee || 0;
   const userName = requestData.userName || 'Customer';
+  const userPhone = requestData.userPhone;
+  const statusDisplay = getStatusDisplay();
 
   return (
-    <View style={styles.overlay} pointerEvents="box-none">
+    <>
+      {/* OVERLAY - only visible when panel is expanded */}
+      <Animated.View 
+        style={[
+          styles.overlay,
+          { opacity: overlayOpacity }
+        ]}
+        pointerEvents={isMinimized ? 'none' : 'auto'}
+      />
+
+      {/* TOP-ANCHORED DRAGGABLE PANEL */}
       <Animated.View
         style={[
           styles.panel,
@@ -393,56 +515,77 @@ export default function GlobalTripRequestPanel() {
             transform: [{ translateY: panelY }],
           },
         ]}
-        {...panResponder.panHandlers}
       >
-        {/* Handle bar - always visible */}
-        <View style={styles.handleContainer}>
-          <View style={styles.handleBar} />
-        </View>
-
         {/* Panel content */}
         <View style={styles.content}>
-          {/* Status badge */}
-          <View style={styles.statusBadge}>
-            <Text style={styles.statusText}>{getStatusText()}</Text>
+          {/* Status badge with countdown */}
+          <View style={styles.statusRow}>
+            <View style={[styles.statusBadge, { backgroundColor: statusDisplay.bgColor }]}>
+              <Text style={[styles.statusText, { color: statusDisplay.color }]}>
+                {statusDisplay.text}
+              </Text>
+            </View>
+            {countdown !== null && currentRequest.status === 'incoming_request' && (
+              <View style={styles.countdownBadge}>
+                <Text style={styles.countdownText}>{countdown}s</Text>
+              </View>
+            )}
           </View>
 
-          {/* Order ID */}
-          <View style={styles.orderIdContainer}>
-            <Hash color="#666" size={14} />
-            <Text style={styles.orderIdText}>{currentRequest.orderId.slice(0, 16)}...</Text>
+          {/* Order ID and workflow type */}
+          <View style={styles.orderInfoRow}>
+            {getWorkflowIcon()}
+            <View style={styles.orderIdContainer}>
+              <Hash color="#999" size={12} />
+              <Text style={styles.orderIdText}>
+                {currentRequest.orderId.length > 16 
+                  ? `${currentRequest.orderId.slice(0, 16)}...` 
+                  : currentRequest.orderId}
+              </Text>
+            </View>
           </View>
 
-          {/* Customer */}
+          {/* Customer info */}
           <View style={styles.infoRow}>
-            <User color="#333" size={18} />
+            <View style={styles.iconCircle}>
+              <User color="#333" size={18} />
+            </View>
             <View style={styles.infoContent}>
               <Text style={styles.label}>Customer</Text>
               <Text style={styles.value}>{userName}</Text>
             </View>
+            {userPhone && (
+              <TouchableOpacity style={styles.phoneButton}>
+                <Phone color="#4CAF50" size={18} />
+              </TouchableOpacity>
+            )}
           </View>
 
           {/* Pickup */}
           <View style={styles.infoRow}>
-            <MapPin color="#00C853" size={18} />
+            <View style={[styles.iconCircle, styles.pickupIcon]}>
+              <MapPin color="#fff" size={16} />
+            </View>
             <View style={styles.infoContent}>
               <Text style={styles.label}>Pickup</Text>
-              <Text style={styles.value} numberOfLines={1}>{pickupAddress}</Text>
+              <Text style={styles.value} numberOfLines={2}>{pickupAddress}</Text>
             </View>
           </View>
 
           {/* Destination */}
           <View style={styles.infoRow}>
-            <Navigation color="#4285F4" size={18} />
+            <View style={[styles.iconCircle, styles.destinationIcon]}>
+              <Navigation color="#fff" size={16} />
+            </View>
             <View style={styles.infoContent}>
               <Text style={styles.label}>Destination</Text>
-              <Text style={styles.value} numberOfLines={1}>{destinationAddress}</Text>
+              <Text style={styles.value} numberOfLines={2}>{destinationAddress}</Text>
             </View>
           </View>
 
           {/* Fare */}
           <View style={styles.fareRow}>
-            <DollarSign color="#FFB300" size={20} />
+            <DollarSign color="#FFB300" size={24} />
             <Text style={styles.fareValue}>R{price.toFixed(2)}</Text>
           </View>
 
@@ -451,16 +594,24 @@ export default function GlobalTripRequestPanel() {
             {renderButtons()}
           </View>
         </View>
+
+        {/* Handle bar at BOTTOM - draggable area */}
+        <View {...panResponder.panHandlers} style={styles.handleContainer}>
+          <View style={styles.handleBar} />
+          <Text style={styles.handleHint}>
+            {isMinimized ? 'Pull down to expand' : 'Swipe up to minimize'}
+          </Text>
+        </View>
       </Animated.View>
-    </View>
+    </>
   );
 }
 
 const styles = StyleSheet.create({
   overlay: {
     ...StyleSheet.absoluteFillObject,
-    zIndex: 9999,
-    elevation: 9999,
+    backgroundColor: '#000',
+    zIndex: 9998,
   },
   panel: {
     position: 'absolute',
@@ -472,70 +623,120 @@ const styles = StyleSheet.create({
     borderBottomLeftRadius: 24,
     borderBottomRightRadius: 24,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.25,
-    shadowRadius: 12,
-    elevation: 20,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 16,
+    elevation: 25,
+    zIndex: 9999,
+  },
+  content: {
+    flex: 1,
+    paddingTop: STATUS_BAR_HEIGHT,
+    paddingHorizontal: 20,
+    paddingBottom: 8,
   },
   handleContainer: {
     alignItems: 'center',
-    paddingTop: Platform.OS === 'ios' ? 50 : 30,
-    paddingBottom: 8,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#F0F0F0',
   },
   handleBar: {
-    width: 40,
+    width: 48,
     height: 5,
     backgroundColor: '#DDD',
     borderRadius: 3,
   },
-  content: {
-    flex: 1,
-    paddingHorizontal: 20,
-    paddingBottom: 20,
+  handleHint: {
+    marginTop: 4,
+    fontSize: 11,
+    color: '#999',
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+    marginBottom: 12,
   },
   statusBadge: {
-    alignSelf: 'center',
-    backgroundColor: '#E8F5E9',
     paddingHorizontal: 16,
     paddingVertical: 6,
     borderRadius: 20,
-    marginBottom: 12,
   },
   statusText: {
     fontSize: 14,
-    fontWeight: '600',
-    color: '#2E7D32',
+    fontWeight: '700',
+  },
+  countdownBadge: {
+    backgroundColor: '#FF6B00',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  countdownText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  orderInfoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 16,
   },
   orderIdContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 16,
     gap: 4,
   },
   orderIdText: {
     fontSize: 12,
-    color: '#666',
+    color: '#999',
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
   infoRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 12,
     paddingHorizontal: 4,
   },
+  iconCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#F5F5F5',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  pickupIcon: {
+    backgroundColor: '#4CAF50',
+  },
+  destinationIcon: {
+    backgroundColor: '#2196F3',
+  },
   infoContent: {
-    marginLeft: 10,
+    marginLeft: 12,
     flex: 1,
   },
   label: {
     fontSize: 11,
     color: '#888',
+    marginBottom: 2,
   },
   value: {
     fontSize: 14,
     fontWeight: '600',
     color: '#333',
+  },
+  phoneButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#E8F5E9',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   fareRow: {
     flexDirection: 'row',
@@ -543,15 +744,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginTop: 8,
     marginBottom: 16,
-    gap: 6,
+    gap: 8,
   },
   fareValue: {
-    fontSize: 24,
-    fontWeight: '700',
+    fontSize: 28,
+    fontWeight: '800',
     color: '#00C853',
   },
   buttonContainer: {
     marginTop: 'auto',
+    marginBottom: 8,
   },
   buttonRow: {
     flexDirection: 'row',
@@ -560,32 +762,67 @@ const styles = StyleSheet.create({
   acceptButton: {
     flex: 1,
     backgroundColor: '#00C853',
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 16,
+    borderRadius: 14,
     alignItems: 'center',
+    shadowColor: '#00C853',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
   },
   rejectButton: {
     flex: 1,
-    backgroundColor: '#E53935',
-    paddingVertical: 14,
-    borderRadius: 12,
+    backgroundColor: '#F44336',
+    paddingVertical: 16,
+    borderRadius: 14,
     alignItems: 'center',
+    shadowColor: '#F44336',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
   },
   actionButton: {
-    backgroundColor: '#2196F3',
-    paddingVertical: 14,
-    borderRadius: 12,
+    paddingVertical: 16,
+    borderRadius: 14,
     alignItems: 'center',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  arrivedButton: {
+    backgroundColor: '#2196F3',
+    shadowColor: '#2196F3',
+  },
+  startButton: {
+    backgroundColor: '#9C27B0',
+    shadowColor: '#9C27B0',
   },
   completeButton: {
     backgroundColor: '#00C853',
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
+    shadowColor: '#00C853',
+  },
+  atStoreButton: {
+    backgroundColor: '#FF9800',
+    shadowColor: '#FF9800',
+  },
+  pickedUpButton: {
+    backgroundColor: '#00BCD4',
+    shadowColor: '#00BCD4',
+  },
+  deliveredButton: {
+    backgroundColor: '#8BC34A',
+    shadowColor: '#8BC34A',
+  },
+  buttonDisabled: {
+    opacity: 0.7,
   },
   buttonText: {
     color: '#fff',
-    fontSize: 16,
+    fontSize: 17,
     fontWeight: '700',
+    letterSpacing: 0.5,
   },
 });

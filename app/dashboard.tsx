@@ -81,8 +81,6 @@ const watchLocation = async (callback: (coords: { latitude: number; longitude: n
 };
 import { ref, update, onValue, off, remove, set } from 'firebase/database';
 import { Home, Mail, Clock, Settings, MapPin, Shield } from 'lucide-react-native';
-import RideRequestPopup from '@/components/RideRequestPopup';
-import RideManagementPanel from '@/components/RideManagementPanel';
 import ChatPanel from '@/components/ChatPanel';
 import ToastNotification from '@/components/ToastNotification';
 import { createGeoFireObject } from '@/utils/geofire';
@@ -98,18 +96,17 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('home');
 
-  const [showRidePopup, setShowRidePopup] = useState(false);
-  const [pendingRide, setPendingRide] = useState<any>(null);
-  const [activeRide, setActiveRide] = useState<any>(null);
-  const [rideStatus, setRideStatus] = useState<'accepted' | 'arrived' | 'in_progress' | null>(null);
+  // Active ride state for location updates (trip managed by GlobalTripRequestPanel)
+  const [activeRideId, setActiveRideId] = useState<string | null>(null);
+  const [activeRideStatus, setActiveRideStatus] = useState<string | null>(null);
   const [driverData, setDriverData] = useState<any>(null);
-  const [isBusy, setIsBusy] = useState(false);
   const [currentLocation, setCurrentLocation] = useState<{ latitude: number; longitude: number } | null>(null);
 
   const [showChatPanel, setShowChatPanel] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showToast, setShowToast] = useState(false);
   const [toastData, setToastData] = useState({ clientName: '', message: '' });
+  const [chatRideInfo, setChatRideInfo] = useState<any>(null);
 
   const sliderX = useRef(new Animated.Value(0)).current;
   // Toggle dimensions - track is full width minus padding, thumb is 48px
@@ -181,64 +178,41 @@ export default function Dashboard() {
       const data = snapshot.val();
       if (data) {
         setIsOnline(data.isOnline === true);
-        setIsBusy(data.isBusy === true);
         sliderX.setValue(data.isOnline ? SLIDE_RANGE : 0);
+        // Track active order for location updates and chat
+        if (data.currentOrderId) {
+          setActiveRideId(data.currentOrderId);
+        } else {
+          setActiveRideId(null);
+          setActiveRideStatus(null);
+        }
       } else {
         setIsOnline(false);
-        setIsBusy(false);
         sliderX.setValue(0);
       }
     });
 
-    // NEW: Listen to driver_trip_requests/{driverUid} for incoming trip requests
+    // Listen for active trip status changes (for location updates and chat)
     const tripRequestsRef = ref(database, `driver_trip_requests/${uid}`);
     const tripRequestsListener = onValue(tripRequestsRef, (snapshot) => {
       const data = snapshot.val();
-      if (!data) {
-        // No pending requests - clear popup if showing
-        if (!activeRide) {
-          setPendingRide(null);
-          setShowRidePopup(false);
+      if (data) {
+        const requests = Object.values(data) as any[];
+        const activeRequest = requests.find(r => 
+          !['completed', 'rejected', 'expired', 'cancelled'].includes(r.status)
+        );
+        if (activeRequest) {
+          setActiveRideId(activeRequest.orderId);
+          setActiveRideStatus(activeRequest.status);
+          setChatRideInfo({
+            id: activeRequest.orderId,
+            clientName: activeRequest.data?.userName || 'Client',
+            clientId: activeRequest.data?.userId || '',
+            pickupAddress: activeRequest.data?.pickupAddress || '',
+            destinationAddress: activeRequest.data?.destinationAddress || '',
+            status: activeRequest.status,
+          });
         }
-        return;
-      }
-
-      // Get all requests and find the latest one
-      const requests = Object.entries(data).map(([orderId, requestData]: [string, any]) => ({
-        orderId,
-        ...requestData,
-      }));
-
-      if (requests.length === 0) return;
-
-      // Get the latest request (most recent by createdAt or last in array)
-      const latestRequest = requests.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
-
-      // Only show popup if status is incoming_request
-      if (latestRequest.status === 'incoming_request') {
-        const requestData = latestRequest.data || {};
-        setPendingRide({
-          id: latestRequest.orderId,
-          orderId: latestRequest.orderId,
-          workflowType: latestRequest.workflowType || 'direct_trip',
-          requestType: latestRequest.requestType,
-          status: latestRequest.status,
-          pickup: requestData.pickupAddress,
-          pickupAddress: requestData.pickupAddress,
-          destination: requestData.destinationAddress,
-          destinationAddress: requestData.destinationAddress,
-          pickupLat: requestData.pickupLat,
-          pickupLng: requestData.pickupLng,
-          dropLat: requestData.dropLat,
-          dropLng: requestData.dropLng,
-          price: requestData.total || requestData.fee,
-          fare: requestData.fee || requestData.total,
-          userName: requestData.userName,
-          userPhone: requestData.userPhone,
-          expiresAt: latestRequest.expiresAt,
-          createdAt: latestRequest.createdAt,
-        });
-        setShowRidePopup(true);
       }
     });
 
@@ -251,13 +225,13 @@ export default function Dashboard() {
 
   useEffect(() => {
     const uid = auth.currentUser?.uid;
-    if (!uid || !activeRide?.id) {
+    if (!uid || !activeRideId) {
       setUnreadCount(0);
       return;
     }
 
-    const rideId = activeRide.id;
-    const clientId = activeRide.userId || activeRide.clientId || '';
+    const rideId = activeRideId;
+    const clientId = chatRideInfo?.clientId || '';
 
     const unsubscribeUnread = getUnreadCount(database, rideId, uid, (count) => {
       setUnreadCount(count);
@@ -269,7 +243,7 @@ export default function Dashboard() {
       uid,
       (message, messageId) => {
         if (message.senderId !== uid && !showChatPanel) {
-          const clientName = activeRide.clientName || activeRide.userName || 'Client';
+          const clientName = chatRideInfo?.clientName || 'Client';
           setToastData({
             clientName,
             message: message.text,
@@ -288,16 +262,17 @@ export default function Dashboard() {
       unsubscribeAutoDelete();
       unsubscribeCleanup();
     };
-  }, [activeRide, showChatPanel]);
+  }, [activeRideId, chatRideInfo, showChatPanel]);
 
   const handleInboxPress = () => {
     const uid = auth.currentUser?.uid;
-    if (!uid || !activeRide?.id) {
+    if (!uid || !activeRideId) {
       return;
     }
 
-    const rideStatus = activeRide?.status;
-    if (rideStatus !== 'accepted' && rideStatus !== 'arrived' && rideStatus !== 'started') {
+    // Allow chat during active trip statuses
+    const validStatuses = ['accepted', 'arrived', 'started', 'at_store', 'picked_up', 'delivered'];
+    if (!activeRideStatus || !validStatuses.includes(activeRideStatus)) {
       return;
     }
 
@@ -326,9 +301,9 @@ export default function Dashboard() {
       console.log('[v0] Driver location updated to driver_locations:', { lat: latitude, lng: longitude, g: geoObject.g });
 
       // Update order location in Firestore if driver has an active order
-      if (activeRide && (rideStatus === 'accepted' || rideStatus === 'arrived' || rideStatus === 'started' || rideStatus === 'at_store' || rideStatus === 'picked_up')) {
+      if (activeRideId && activeRideStatus && ['accepted', 'arrived', 'started', 'at_store', 'picked_up'].includes(activeRideStatus)) {
         try {
-          const orderRef = doc(firestore, 'orders', activeRide.id);
+          const orderRef = doc(firestore, 'orders', activeRideId);
           await updateDoc(orderRef, {
             driverLocation: {
               latitude,
@@ -433,187 +408,8 @@ export default function Dashboard() {
     }).start();
   };
 
-  // Trip requests come from RTDB driver_trip_requests/{uid}
-  // Trip lifecycle updates go to Firestore orders collection
-
-  const handleAcceptRide = async () => {
-    const uid = auth.currentUser?.uid;
-    if (!uid || !pendingRide) {
-      return;
-    }
-
-    try {
-      // Call backend API to accept the request
-      const response = await fetch('/api/acceptDriverRequest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId: pendingRide.orderId || pendingRide.id,
-          driverId: uid,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to accept request');
-      }
-
-      // Update drivers_online/{uid} isBusy = true
-      await update(ref(database, `drivers_online/${uid}`), {
-        isBusy: true,
-        currentOrderId: pendingRide.orderId || pendingRide.id,
-        lastUpdated: Date.now(),
-      });
-
-      // Set as active ride after acceptance
-      setActiveRide(pendingRide);
-      setRideStatus('accepted');
-      setShowRidePopup(false);
-      setPendingRide(null);
-    } catch (error) {
-      console.error('[v0] Error accepting ride:', error);
-    }
-  };
-
-  const handleRejectRide = async () => {
-    const uid = auth.currentUser?.uid;
-    if (!uid || !pendingRide) {
-      setShowRidePopup(false);
-      setPendingRide(null);
-      return;
-    }
-
-    try {
-      // Call backend API to decline the request
-      await fetch('/api/declineDriverRequest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId: pendingRide.orderId || pendingRide.id,
-          driverId: uid,
-        }),
-      });
-    } catch (error) {
-      console.error('[v0] Error declining ride:', error);
-    }
-
-    setShowRidePopup(false);
-    setPendingRide(null);
-  };
-
-  const handleCancelRide = () => {
-    // Same as reject - decline the request
-    handleRejectRide();
-  };
-
-  // STORE DELIVERY HANDLERS - All updates go to Firestore
-  const handleAtStore = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'at_store',
-        atStoreAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error updating to at_store:', error);
-    }
-  };
-
-  const handlePickedUp = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'picked_up',
-        pickedUpAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error updating to picked_up:', error);
-    }
-  };
-
-  const handleDelivered = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'delivered',
-        deliveredAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error updating to delivered:', error);
-    }
-  };
-
-  // DIRECT TRIP HANDLERS - All updates go to Firestore
-  const handleAcceptTrip = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'accepted',
-        driverStatus: 'accepted',
-        acceptedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error accepting trip:', error);
-    }
-  };
-
-  const handleArrived = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'arrived',
-        arrivedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error updating to arrived:', error);
-    }
-  };
-
-  const handleStartTrip = async () => {
-    if (!activeRide) return;
-    try {
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'started',
-        startedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('[v0] Error starting trip:', error);
-    }
-  };
-
-  const handleCompleteTrip = async () => {
-    const uid = auth.currentUser?.uid;
-    if (!uid || !activeRide) {
-      return;
-    }
-
-    try {
-      // Update Firestore order to completed
-      const orderRef = doc(firestore, 'orders', activeRide.id);
-      await updateDoc(orderRef, {
-        status: 'completed',
-        driverStatus: 'completed',
-        completedAt: Date.now(),
-      });
-
-      // Update drivers_online/{uid} isBusy = false
-      await update(ref(database, `drivers_online/${uid}`), {
-        isBusy: false,
-        currentOrderId: null,
-        lastUpdated: Date.now(),
-      });
-
-      setActiveRide(null);
-      setRideStatus(null);
-    } catch (error) {
-      console.error('[v0] Error completing trip:', error);
-    }
-  };
+  // All trip lifecycle handling is now done via GlobalTripRequestPanel
+  // which listens to RTDB driver_trip_requests/{uid} and calls backend APIs
 
   const startX = useRef(0);
   const savedTranslateX = useRef(0);
@@ -738,40 +534,19 @@ export default function Dashboard() {
 
   return (
     <View style={styles.container}>
-      {/* RIDE REQUEST POPUP */}
-      <RideRequestPopup
-        visible={showRidePopup}
-        ride={pendingRide}
-        onAccept={handleAcceptRide}
-        onReject={handleRejectRide}
-        onCancel={handleCancelRide}
-      />
-
-      {/* RIDE MANAGEMENT PANEL - supports workflowType: store_delivery or direct_trip */}
-      <RideManagementPanel
-        rideStatus={rideStatus}
-        rideInfo={activeRide}
-        workflowType={activeRide?.workflowType}
-        onAtStore={handleAtStore}
-        onPickedUp={handlePickedUp}
-        onDelivered={handleDelivered}
-        onAcceptTrip={handleAcceptTrip}
-        onArrived={handleArrived}
-        onStartTrip={handleStartTrip}
-        onCompleteTrip={handleCompleteTrip}
-      />
+      {/* Trip request handling is now done globally via GlobalTripRequestPanel in _layout.tsx */}
 
       {/* CHAT PANEL */}
       <ChatPanel
         visible={showChatPanel}
         onClose={() => setShowChatPanel(false)}
-        rideId={activeRide?.id || null}
-        clientName={activeRide?.clientName || activeRide?.userName || 'Client'}
-        clientId={activeRide?.userId || activeRide?.clientId || ''}
+        rideId={activeRideId}
+        clientName={chatRideInfo?.clientName || 'Client'}
+        clientId={chatRideInfo?.clientId || ''}
         driverName={driverData ? `${driverData.profile?.firstName || ''} ${driverData.profile?.lastName || ''}`.trim() || 'Driver' : 'Driver'}
-        pickupAddress={activeRide?.pickupAddress || 'Pickup'}
-        destinationAddress={activeRide?.destinationAddress || 'Destination'}
-        rideStatus={activeRide?.status || null}
+        pickupAddress={chatRideInfo?.pickupAddress || 'Pickup'}
+        destinationAddress={chatRideInfo?.destinationAddress || 'Destination'}
+        rideStatus={activeRideStatus}
       />
 
       {/* TOAST NOTIFICATION */}

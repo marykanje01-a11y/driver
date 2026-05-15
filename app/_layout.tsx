@@ -4,8 +4,8 @@ import { StatusBar } from 'expo-status-bar';
 import { View, Text, StyleSheet, Animated, Dimensions } from 'react-native';
 import { useFrameworkReady } from '@/hooks/useFrameworkReady';
 import { RegistrationProvider } from '@/context/RegistrationContext';
-import { IncomingRidesProvider } from '@/context/IncomingRidesContext';
-import GlobalRideRequestOverlay from '@/components/GlobalRideRequestOverlay';
+import { TripRequestProvider } from '@/context/IncomingRidesContext';
+import GlobalTripRequestPanel from '@/components/GlobalTripRequestPanel';
 
 function SplashScreen({ onFinish }: { onFinish: () => void }) {
   const fadeAnim = new Animated.Value(0);
@@ -99,7 +99,7 @@ export default function RootLayout() {
 
   return (
     <RegistrationProvider>
-      <IncomingRidesProvider>
+      <TripRequestProvider>
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="index" />
           <Stack.Screen name="registration-terms" />
@@ -120,9 +120,10 @@ export default function RootLayout() {
           <Stack.Screen name="forgot-password" />
           <Stack.Screen name="+not-found" />
         </Stack>
-        <GlobalRideRequestOverlay />
+        {/* GLOBAL RTDB-BASED TRIP REQUEST PANEL - renders above all screens */}
+        <GlobalTripRequestPanel />
         <StatusBar style="light" />
-      </IncomingRidesProvider>
+      </TripRequestProvider>
     </RegistrationProvider>
   );
 }
