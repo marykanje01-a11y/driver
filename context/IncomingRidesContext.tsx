@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { ref, onValue, off } from 'firebase/database';
+import { onAuthStateChanged } from 'firebase/auth';
 import { database, auth } from '@/config/firebase';
 
 // RTDB-based trip request structure
@@ -46,24 +47,33 @@ export function TripRequestProvider({ children }: { children: ReactNode }) {
   const [isVisible, setIsVisible] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [driverUid, setDriverUid] = useState<string | null>(null);
 
+  // Listen for auth state changes to get authenticated driver UID
   useEffect(() => {
-    const checkAuth = () => {
-      const uid = auth.currentUser?.uid;
-      if (!uid) {
-        // Clear state when not authenticated
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user?.uid) {
+        setDriverUid(user.uid);
+      } else {
+        setDriverUid(null);
+        // Clear all state when user logs out
         setCurrentRequest(null);
         setIsVisible(false);
-        return null;
+        setIsMinimized(false);
       }
-      return uid;
-    };
+    });
+    return () => unsubscribe();
+  }, []);
 
-    const uid = checkAuth();
-    if (!uid) return;
+  // RTDB listener - ONLY starts when driverUid is available
+  useEffect(() => {
+    // CRITICAL: Do NOT start listener if no authenticated driver UID
+    if (!driverUid) {
+      return;
+    }
 
     // Listen ONLY to driver_trip_requests/{driverUid} in RTDB
-    const tripRequestsRef = ref(database, `driver_trip_requests/${uid}`);
+    const tripRequestsRef = ref(database, `driver_trip_requests/${driverUid}`);
     
     const listener = onValue(tripRequestsRef, (snapshot) => {
       const data = snapshot.val();
@@ -124,7 +134,7 @@ export function TripRequestProvider({ children }: { children: ReactNode }) {
     });
 
     return () => off(tripRequestsRef, 'value', listener);
-  }, [currentRequest?.status, isVisible]);
+  }, [driverUid, currentRequest?.status, isVisible]);
 
   const clearRequest = () => {
     setCurrentRequest(null);

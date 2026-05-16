@@ -53,6 +53,9 @@ interface TripRequest {
 const API_BASE = '';
 
 export default function GlobalTripRequestPanel() {
+  // CRITICAL: Get driver UID immediately - if no UID, don't render anything
+  const driverUid = auth.currentUser?.uid;
+  
   const [currentRequest, setCurrentRequest] = useState<TripRequest | null>(null);
   const [isVisible, setIsVisible] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
@@ -141,11 +144,16 @@ export default function GlobalTripRequestPanel() {
   }, [currentRequest?.orderId, currentRequest?.status, currentRequest?.expiresAt]);
 
   // Listen to driver_trip_requests/{driverUid} - PERMANENT GLOBAL LISTENER
+  // CRITICAL: Only start listener if driverUid exists
   useEffect(() => {
-    const uid = auth.currentUser?.uid;
-    if (!uid) return;
+    if (!driverUid) {
+      // No authenticated driver - clear all state and don't start listener
+      setCurrentRequest(null);
+      setIsVisible(false);
+      return;
+    }
 
-    const tripRequestsRef = ref(database, `driver_trip_requests/${uid}`);
+    const tripRequestsRef = ref(database, `driver_trip_requests/${driverUid}`);
     
     const listener = onValue(tripRequestsRef, (snapshot) => {
       const data = snapshot.val();
@@ -208,7 +216,7 @@ export default function GlobalTripRequestPanel() {
     });
 
     return () => off(tripRequestsRef, 'value', listener);
-  }, [currentRequest?.status, isVisible, animateToPosition]);
+  }, [driverUid, currentRequest?.status, isVisible, animateToPosition]);
 
   // Accept handler with independent loading state
   const handleAccept = async () => {
@@ -527,6 +535,12 @@ export default function GlobalTripRequestPanel() {
     return <Car color="#333" size={20} />;
   };
 
+  // CRITICAL: Do NOT render if driver is not authenticated
+  if (!driverUid) {
+    return null;
+  }
+
+  // Do not render if no active request or not visible
   if (!isVisible || !currentRequest) return null;
 
   const requestData = currentRequest.data || {};

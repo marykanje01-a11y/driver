@@ -9,6 +9,26 @@ import GlobalTripRequestPanel from '@/components/GlobalTripRequestPanel';
 import { auth } from '@/config/firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
 
+// Auth screens that should NOT have the dispatch popup
+const AUTH_SCREENS = [
+  'index',
+  'registration-terms',
+  'personal-info',
+  'personal-picture',
+  'step2',
+  'step3',
+  'cyclist-step',
+  'license-step',
+  'driver-license-instructions',
+  'selfie-with-license-instructions',
+  'id-step',
+  'ridesDelivery',
+  'vehicle-information',
+  'chooseLocation',
+  'application-submitted',
+  'forgot-password',
+];
+
 function SplashScreen({ onFinish }: { onFinish: () => void }) {
   const fadeAnim = new Animated.Value(0);
   const scaleAnim = new Animated.Value(0.3);
@@ -90,11 +110,13 @@ export default function RootLayout() {
   useFrameworkReady();
   const [showSplash, setShowSplash] = useState(true);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   
   // Listen for authentication state changes
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setCurrentUser(user);
+      setIsAuthReady(true);
     });
     return () => unsubscribe();
   }, []);
@@ -103,11 +125,45 @@ export default function RootLayout() {
 
   if (showSplash) {
     return <SplashScreen onFinish={() => {
-      console.log('[v0] Setting showSplash to false');
       setShowSplash(false);
     }} />;
   }
 
+  // Determine if driver is authenticated - MUST have UID
+  const driverUid = currentUser?.uid;
+  const isAuthenticated = isAuthReady && !!driverUid;
+
+  // If NOT authenticated: render auth screens WITHOUT dispatch overlay
+  if (!isAuthenticated) {
+    return (
+      <RegistrationProvider>
+        <Stack screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="index" />
+          <Stack.Screen name="registration-terms" />
+          <Stack.Screen name="personal-info" />
+          <Stack.Screen name="personal-picture" />
+          <Stack.Screen name="step2" />
+          <Stack.Screen name="step3" />
+          <Stack.Screen name="cyclist-step" />
+          <Stack.Screen name="license-step" />
+          <Stack.Screen name="driver-license-instructions" />
+          <Stack.Screen name="selfie-with-license-instructions" />
+          <Stack.Screen name="id-step" />
+          <Stack.Screen name="ridesDelivery" />
+          <Stack.Screen name="vehicle-information" />
+          <Stack.Screen name="chooseLocation" />
+          <Stack.Screen name="application-submitted" />
+          <Stack.Screen name="forgot-password" />
+          <Stack.Screen name="dashboard" />
+          <Stack.Screen name="+not-found" />
+        </Stack>
+        <StatusBar style="light" />
+      </RegistrationProvider>
+    );
+  }
+
+  // AUTHENTICATED: render with TripRequestProvider and GlobalTripRequestPanel
+  // The dispatch popup will ONLY appear here when driver is signed in
   return (
     <RegistrationProvider>
       <TripRequestProvider>
@@ -131,8 +187,8 @@ export default function RootLayout() {
           <Stack.Screen name="forgot-password" />
           <Stack.Screen name="+not-found" />
         </Stack>
-        {/* GLOBAL RTDB-BASED TRIP REQUEST PANEL - ONLY renders when driver is authenticated */}
-        {currentUser?.uid && <GlobalTripRequestPanel />}
+        {/* GLOBAL RTDB-BASED TRIP REQUEST PANEL - ONLY renders for authenticated driver */}
+        <GlobalTripRequestPanel />
         <StatusBar style="light" />
       </TripRequestProvider>
     </RegistrationProvider>
