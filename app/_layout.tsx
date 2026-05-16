@@ -6,6 +6,8 @@ import { useFrameworkReady } from '@/hooks/useFrameworkReady';
 import { RegistrationProvider } from '@/context/RegistrationContext';
 import { TripRequestProvider } from '@/context/IncomingRidesContext';
 import GlobalTripRequestPanel from '@/components/GlobalTripRequestPanel';
+import { auth } from '@/config/firebase';
+import { onAuthStateChanged, User } from 'firebase/auth';
 
 function SplashScreen({ onFinish }: { onFinish: () => void }) {
   const fadeAnim = new Animated.Value(0);
@@ -87,6 +89,15 @@ const splashStyles = StyleSheet.create({
 export default function RootLayout() {
   useFrameworkReady();
   const [showSplash, setShowSplash] = useState(true);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  
+  // Listen for authentication state changes
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
   
   console.log('[v0] RootLayout render, showSplash:', showSplash);
 
@@ -120,8 +131,8 @@ export default function RootLayout() {
           <Stack.Screen name="forgot-password" />
           <Stack.Screen name="+not-found" />
         </Stack>
-        {/* GLOBAL RTDB-BASED TRIP REQUEST PANEL - renders above all screens */}
-        <GlobalTripRequestPanel />
+        {/* GLOBAL RTDB-BASED TRIP REQUEST PANEL - ONLY renders when driver is authenticated */}
+        {currentUser?.uid && <GlobalTripRequestPanel />}
         <StatusBar style="light" />
       </TripRequestProvider>
     </RegistrationProvider>

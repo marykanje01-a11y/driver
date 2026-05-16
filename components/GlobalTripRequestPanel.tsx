@@ -10,7 +10,7 @@ import {
   Platform,
   ActivityIndicator,
 } from 'react-native';
-import { User, MapPin, Navigation, DollarSign, Hash, Phone, Package, Car, Truck } from 'lucide-react-native';
+import { User, MapPin, Navigation, Hash, Phone, Package, Car, Truck } from 'lucide-react-native';
 import { ref, onValue, off } from 'firebase/database';
 import { database, auth } from '@/config/firebase';
 
@@ -56,7 +56,10 @@ export default function GlobalTripRequestPanel() {
   const [currentRequest, setCurrentRequest] = useState<TripRequest | null>(null);
   const [isVisible, setIsVisible] = useState(false);
   const [isMinimized, setIsMinimized] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
+  // Independent loading states for each button - DO NOT share loading state
+  const [isAccepting, setIsAccepting] = useState(false);
+  const [isRejecting, setIsRejecting] = useState(false);
+  const [isActionLoading, setIsActionLoading] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
 
   // Animation value for panel position
@@ -207,70 +210,98 @@ export default function GlobalTripRequestPanel() {
     return () => off(tripRequestsRef, 'value', listener);
   }, [currentRequest?.status, isVisible, animateToPosition]);
 
-  // API call handlers - DO NOT manually close popup, WAIT for RTDB status update
-  const callBackendAction = async (action: string) => {
+  // Accept handler with independent loading state
+  const handleAccept = async () => {
     const uid = auth.currentUser?.uid;
     if (!uid || !currentRequest) return;
 
-    setIsLoading(true);
+    setIsAccepting(true);
     try {
-      let endpoint = '';
-      let body: Record<string, unknown> = {
-        orderId: currentRequest.orderId,
-        driverId: uid,
-      };
-
-      switch (action) {
-        case 'accept':
-          endpoint = `${API_BASE}/api/acceptDriverRequest`;
-          break;
-        case 'reject':
-          endpoint = `${API_BASE}/api/declineDriverRequest`;
-          break;
-        case 'arrived':
-        case 'started':
-        case 'at_store':
-        case 'picked_up':
-        case 'delivered':
-        case 'completed':
-          endpoint = `${API_BASE}/api/updateTripStatus`;
-          body.status = action;
-          break;
-        default:
-          console.error('[v0] Unknown action:', action);
-          return;
-      }
-
-      const response = await fetch(endpoint, {
+      const response = await fetch(`${API_BASE}/api/acceptDriverRequest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          orderId: currentRequest.orderId,
+          driverId: uid,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to accept: ${errorText}`);
+      }
+      // DO NOT manually close popup or change state - WAIT for RTDB status update
+    } catch (error) {
+      console.error('[v0] Error accepting trip:', error);
+    } finally {
+      setIsAccepting(false);
+    }
+  };
+
+  // Reject handler with independent loading state
+  const handleReject = async () => {
+    const uid = auth.currentUser?.uid;
+    if (!uid || !currentRequest) return;
+
+    setIsRejecting(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/declineDriverRequest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orderId: currentRequest.orderId,
+          driverId: uid,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Failed to reject: ${errorText}`);
+      }
+      // DO NOT manually close popup - WAIT for RTDB status update
+    } catch (error) {
+      console.error('[v0] Error rejecting trip:', error);
+    } finally {
+      setIsRejecting(false);
+    }
+  };
+
+  // Generic action handler for trip lifecycle statuses
+  const handleTripAction = async (action: string) => {
+    const uid = auth.currentUser?.uid;
+    if (!uid || !currentRequest) return;
+
+    setIsActionLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/updateTripStatus`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          orderId: currentRequest.orderId,
+          driverId: uid,
+          status: action,
+        }),
       });
 
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Failed to ${action}: ${errorText}`);
       }
-
-      // DO NOT manually close or update state
-      // WAIT for RTDB listener to receive status update
-      console.log(`[v0] ${action} request sent successfully`);
+      // DO NOT manually update state - WAIT for RTDB status update
     } catch (error) {
       console.error(`[v0] Error calling ${action}:`, error);
     } finally {
-      setIsLoading(false);
+      setIsActionLoading(false);
     }
   };
 
-  // Button handlers
-  const handleAccept = () => callBackendAction('accept');
-  const handleReject = () => callBackendAction('reject');
-  const handleArrived = () => callBackendAction('arrived');
-  const handleStartTrip = () => callBackendAction('started');
-  const handleComplete = () => callBackendAction('completed');
-  const handleAtStore = () => callBackendAction('at_store');
-  const handlePickedUp = () => callBackendAction('picked_up');
-  const handleDelivered = () => callBackendAction('delivered');
+  // Button handlers - use specific handlers for accept/reject, generic for others
+  const handleArrived = () => handleTripAction('arrived');
+  const handleStartTrip = () => handleTripAction('started');
+  const handleComplete = () => handleTripAction('completed');
+  const handleAtStore = () => handleTripAction('at_store');
+  const handlePickedUp = () => handleTripAction('picked_up');
+  const handleDelivered = () => handleTripAction('delivered');
 
   // Render buttons based on workflowType and RTDB status
   const renderButtons = () => {
@@ -285,22 +316,22 @@ export default function GlobalTripRequestPanel() {
           return (
             <View style={styles.buttonRow}>
               <TouchableOpacity 
-                style={[styles.rejectButton, isLoading && styles.buttonDisabled]} 
+                style={[styles.rejectButton, isRejecting && styles.buttonDisabled]} 
                 onPress={handleReject}
-                disabled={isLoading}
+                disabled={isRejecting || isAccepting}
               >
-                {isLoading ? (
+                {isRejecting ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.buttonText}>Reject</Text>
                 )}
               </TouchableOpacity>
               <TouchableOpacity 
-                style={[styles.acceptButton, isLoading && styles.buttonDisabled]} 
+                style={[styles.acceptButton, isAccepting && styles.buttonDisabled]} 
                 onPress={handleAccept}
-                disabled={isLoading}
+                disabled={isAccepting || isRejecting}
               >
-                {isLoading ? (
+                {isAccepting ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.buttonText}>Accept</Text>
@@ -311,11 +342,11 @@ export default function GlobalTripRequestPanel() {
         case 'accepted':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.arrivedButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.arrivedButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleArrived}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>Arrived</Text>
@@ -325,11 +356,11 @@ export default function GlobalTripRequestPanel() {
         case 'arrived':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.startButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.startButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleStartTrip}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>Start Trip</Text>
@@ -339,17 +370,22 @@ export default function GlobalTripRequestPanel() {
         case 'started':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.completeButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.completeButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleComplete}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>Complete</Text>
               )}
             </TouchableOpacity>
           );
+        case 'completed':
+        case 'rejected':
+        case 'expired':
+        case 'cancelled':
+          return null;
         default:
           return null;
       }
@@ -362,22 +398,22 @@ export default function GlobalTripRequestPanel() {
           return (
             <View style={styles.buttonRow}>
               <TouchableOpacity 
-                style={[styles.rejectButton, isLoading && styles.buttonDisabled]} 
+                style={[styles.rejectButton, isRejecting && styles.buttonDisabled]} 
                 onPress={handleReject}
-                disabled={isLoading}
+                disabled={isRejecting || isAccepting}
               >
-                {isLoading ? (
+                {isRejecting ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.buttonText}>Reject</Text>
                 )}
               </TouchableOpacity>
               <TouchableOpacity 
-                style={[styles.acceptButton, isLoading && styles.buttonDisabled]} 
+                style={[styles.acceptButton, isAccepting && styles.buttonDisabled]} 
                 onPress={handleAccept}
-                disabled={isLoading}
+                disabled={isAccepting || isRejecting}
               >
-                {isLoading ? (
+                {isAccepting ? (
                   <ActivityIndicator color="#fff" size="small" />
                 ) : (
                   <Text style={styles.buttonText}>Accept</Text>
@@ -388,11 +424,11 @@ export default function GlobalTripRequestPanel() {
         case 'accepted':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.atStoreButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.atStoreButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleAtStore}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>At Store</Text>
@@ -402,11 +438,11 @@ export default function GlobalTripRequestPanel() {
         case 'at_store':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.pickedUpButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.pickedUpButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handlePickedUp}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>Picked Up</Text>
@@ -416,11 +452,11 @@ export default function GlobalTripRequestPanel() {
         case 'picked_up':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.deliveredButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.deliveredButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleDelivered}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
                 <Text style={styles.buttonText}>Delivered</Text>
@@ -430,17 +466,22 @@ export default function GlobalTripRequestPanel() {
         case 'delivered':
           return (
             <TouchableOpacity 
-              style={[styles.actionButton, styles.completeButton, isLoading && styles.buttonDisabled]} 
+              style={[styles.actionButton, styles.completeButton, isActionLoading && styles.buttonDisabled]} 
               onPress={handleComplete}
-              disabled={isLoading}
+              disabled={isActionLoading}
             >
-              {isLoading ? (
+              {isActionLoading ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
-                <Text style={styles.buttonText}>Complete</Text>
+                <Text style={styles.buttonText}>Complete Delivery</Text>
               )}
             </TouchableOpacity>
           );
+        case 'completed':
+        case 'rejected':
+        case 'expired':
+        case 'cancelled':
+          return null;
         default:
           return null;
       }
@@ -491,7 +532,6 @@ export default function GlobalTripRequestPanel() {
   const requestData = currentRequest.data || {};
   const pickupAddress = requestData.pickupAddress || 'Unknown location';
   const destinationAddress = requestData.destinationAddress || 'Unknown destination';
-  const price = requestData.total || requestData.fee || 0;
   const userName = requestData.userName || 'Customer';
   const userPhone = requestData.userPhone;
   const statusDisplay = getStatusDisplay();
@@ -581,12 +621,6 @@ export default function GlobalTripRequestPanel() {
               <Text style={styles.label}>Destination</Text>
               <Text style={styles.value} numberOfLines={2}>{destinationAddress}</Text>
             </View>
-          </View>
-
-          {/* Fare */}
-          <View style={styles.fareRow}>
-            <DollarSign color="#FFB300" size={24} />
-            <Text style={styles.fareValue}>R{price.toFixed(2)}</Text>
           </View>
 
           {/* Action buttons */}
@@ -737,19 +771,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#E8F5E9',
     justifyContent: 'center',
     alignItems: 'center',
-  },
-  fareRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 8,
-    marginBottom: 16,
-    gap: 8,
-  },
-  fareValue: {
-    fontSize: 28,
-    fontWeight: '800',
-    color: '#00C853',
   },
   buttonContainer: {
     marginTop: 'auto',
